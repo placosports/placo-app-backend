@@ -22,6 +22,7 @@ app.use(cookieParser());
 const allowedOrigins = [
   'http://localhost:3000',
   'https://placo-app.vercel.app',
+  'https://www.theplaco.com',
 ].filter(Boolean); // Remove any undefined/null values
 
 app.use(cors({
