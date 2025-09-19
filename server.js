@@ -20,7 +20,8 @@ app.use(cookieParser());
 
 // CORS for frontend - Allow multiple origins
 const allowedOrigins = [
-  'http://localhost:3000'
+  'http://localhost:3000',
+  'https://placo-app.vercel.app/',
 ].filter(Boolean); // Remove any undefined/null values
 
 app.use(cors({
