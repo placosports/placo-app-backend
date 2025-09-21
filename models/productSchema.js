@@ -52,9 +52,24 @@ const productSchema = new mongoose.Schema({
             trim: true
         }
     ],
+    // Changed from boolean to number for stock quantity
+    stockQuantity: {
+        type: Number,
+        required: true,
+        min: 0,
+        default: 0
+    },
+    // Add a computed field for backward compatibility
     inStock: {
         type: Boolean,
-        default: true
+        default: function() {
+            return this.stockQuantity > 0;
+        }
+    },
+    // Low stock threshold for alerts
+    lowStockThreshold: {
+        type: Number,
+        default: 5
     },
     createdAt: {
         type: Date,
@@ -66,7 +81,12 @@ const productSchema = new mongoose.Schema({
             public_id: { type: String, required: true } 
         }
     ]
-    
+});
+
+// Pre-save middleware to update inStock based on stockQuantity
+productSchema.pre('save', function(next) {
+    this.inStock = this.stockQuantity > 0;
+    next();
 });
 
 // Create Product model

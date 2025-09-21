@@ -21,11 +21,15 @@ router.post(
         public_id: file.filename
       }));
 
-      const newProduct = new productdb({
+      // Ensure stockQuantity is set properly
+      const productData = {
         ...req.body,
-        images
-      });
+        images,
+        stockQuantity: parseInt(req.body.stockQuantity) || 0,
+        lowStockThreshold: parseInt(req.body.lowStockThreshold) || 5
+      };
 
+      const newProduct = new productdb(productData);
       const savedProduct = await newProduct.save();
       res.status(201).json(savedProduct);
     } catch (err) {
@@ -58,13 +62,84 @@ router.put(
         }));
       }
 
-      // update other fields
-      Object.assign(product, req.body);
+      // Update other fields including stock quantity
+      const updateData = { ...req.body };
+      if (updateData.stockQuantity !== undefined) {
+        updateData.stockQuantity = parseInt(updateData.stockQuantity) || 0;
+      }
+      if (updateData.lowStockThreshold !== undefined) {
+        updateData.lowStockThreshold = parseInt(updateData.lowStockThreshold) || 5;
+      }
+
+      Object.assign(product, updateData);
 
       const updatedProduct = await product.save();
       res.status(200).json(updatedProduct);
     } catch (err) {
       res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+// Update stock quantity specifically (Admin only)
+router.patch(
+  "/products/:id/stock",
+  authenticate,
+  authorizeRole("admin"),
+  async (req, res) => {
+    try {
+      const { stockQuantity, operation } = req.body; // operation: 'set', 'add', 'subtract'
+      const product = await productdb.findById(req.params.id);
+      
+      if (!product) return res.status(404).json({ error: "Product not found" });
+
+      let newStock;
+      switch (operation) {
+        case 'add':
+          newStock = product.stockQuantity + parseInt(stockQuantity);
+          break;
+        case 'subtract':
+          newStock = Math.max(0, product.stockQuantity - parseInt(stockQuantity));
+          break;
+        case 'set':
+        default:
+          newStock = parseInt(stockQuantity) || 0;
+          break;
+      }
+
+      product.stockQuantity = newStock;
+      const updatedProduct = await product.save();
+      
+      res.status(200).json({
+        message: "Stock updated successfully",
+        product: updatedProduct,
+        previousStock: operation === 'set' ? null : product.stockQuantity,
+        newStock: newStock
+      });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+// Get low stock products (Admin only)
+router.get(
+  "/products/low-stock",
+  authenticate,
+  authorizeRole("admin"),
+  async (req, res) => {
+    try {
+      const products = await productdb.find({
+        $expr: { $lte: ["$stockQuantity", "$lowStockThreshold"] },
+        stockQuantity: { $gte: 0 }
+      }).sort({ stockQuantity: 1 });
+      
+      res.status(200).json({
+        message: `Found ${products.length} products with low stock`,
+        products
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
     }
   }
 );
@@ -95,9 +170,31 @@ router.delete(
 // ---------------- Public Routes ---------------- //
 
 // Get all products (any authenticated user)
-router.get("/products",  async (req, res) => {
+router.get("/products", async (req, res) => {
   try {
-    const products = await productdb.find();
+    const { inStock, category, minPrice, maxPrice } = req.query;
+    let filter = {};
+    
+    // Filter by stock availability
+    if (inStock === 'true') {
+      filter.stockQuantity = { $gt: 0 };
+    } else if (inStock === 'false') {
+      filter.stockQuantity = 0;
+    }
+    
+    // Filter by category
+    if (category) {
+      filter.productCategory = { $regex: category, $options: 'i' };
+    }
+    
+    // Filter by price range
+    if (minPrice || maxPrice) {
+      filter.price = {};
+      if (minPrice) filter.price.$gte = parseFloat(minPrice);
+      if (maxPrice) filter.price.$lte = parseFloat(maxPrice);
+    }
+    
+    const products = await productdb.find(filter);
     res.status(200).json(products);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -105,11 +202,34 @@ router.get("/products",  async (req, res) => {
 });
 
 // Get single product by ID (any authenticated user)
-router.get("/products/:id",  async (req, res) => {
+router.get("/products/:id", async (req, res) => {
   try {
     const product = await productdb.findById(req.params.id);
     if (!product) return res.status(404).json({ error: "Product not found" });
     res.status(200).json(product);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Check product availability for specific quantity
+router.get("/products/:id/availability/:quantity", async (req, res) => {
+  try {
+    const { id, quantity } = req.params;
+    const product = await productdb.findById(id);
+    
+    if (!product) return res.status(404).json({ error: "Product not found" });
+    
+    const requestedQuantity = parseInt(quantity);
+    const available = product.stockQuantity >= requestedQuantity;
+    
+    res.status(200).json({
+      available,
+      requestedQuantity,
+      availableStock: product.stockQuantity,
+      productName: product.productName,
+      maxQuantity: product.stockQuantity
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

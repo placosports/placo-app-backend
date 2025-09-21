@@ -41,23 +41,27 @@ router.get("/check-cod/:pincode", async (req, res) => {
   }
 });
 
-// ✅ 2. Create order from cart
-// ✅ 2. Create order from cart - CORRECTED VERSION
+// ✅ 2. Create order from cart with stock management
 router.post("/create", authenticate, async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
   try {
     const { shippingAddress, paymentMethod } = req.body;
     const userId = req.rootUser._id;
     
     // Get user's cart WITHOUT populate to avoid ObjectId casting errors
-    const cart = await cartdb.findOne({ user: userId });
+    const cart = await cartdb.findOne({ user: userId }).session(session);
     
     if (!cart || cart.items.length === 0) {
+      await session.abortTransaction();
       return res.status(400).json({ message: "Cart is empty" });
     }
     
-    // Get product details and calculate totals
+    // Get product details, check stock, and calculate totals
     let orderItems = [];
     let subtotal = 0;
+    let stockUpdates = []; // Track stock changes for rollback if needed
     
     for (const cartItem of cart.items) {
       let product;
@@ -65,17 +69,45 @@ router.post("/create", authenticate, async (req, res) => {
       // Check if the productId is a valid MongoDB ObjectId or custom string
       if (mongoose.Types.ObjectId.isValid(cartItem.productId)) {
         // Query by MongoDB _id
-        product = await productdb.findById(cartItem.productId);
+        product = await productdb.findById(cartItem.productId).session(session);
       } else {
         // Query by custom productId field
-        product = await productdb.findOne({ productId: cartItem.productId });
+        product = await productdb.findOne({ productId: cartItem.productId }).session(session);
       }
       
-      if (!product || !product.inStock) {
+      if (!product) {
+        await session.abortTransaction();
         return res.status(400).json({ 
-          message: `Product ${product?.productName || cartItem.productId} is not available` 
+          message: `Product ${cartItem.productId} not found` 
         });
       }
+      
+      // Check if enough stock is available
+      if (product.stockQuantity < cartItem.quantity) {
+        await session.abortTransaction();
+        return res.status(400).json({ 
+          message: `Insufficient stock for ${product.productName}. Available: ${product.stockQuantity}, Requested: ${cartItem.quantity}` 
+        });
+      }
+      
+      // Reserve stock by reducing the quantity
+      const newStockQuantity = product.stockQuantity - cartItem.quantity;
+      await productdb.findByIdAndUpdate(
+        product._id,
+        { 
+          stockQuantity: newStockQuantity,
+          inStock: newStockQuantity > 0 
+        },
+        { session }
+      );
+      
+      // Track this change for potential rollback
+      stockUpdates.push({
+        productId: product._id,
+        originalQuantity: product.stockQuantity,
+        newQuantity: newStockQuantity,
+        reservedQuantity: cartItem.quantity
+      });
       
       const itemSubtotal = product.price * cartItem.quantity;
       subtotal += itemSubtotal;
@@ -122,26 +154,119 @@ router.post("/create", authenticate, async (req, res) => {
       },
       shippingAddress,
       paymentMethod,
-      paymentStatus: paymentMethod === "COD" ? "PENDING" : "PENDING"
+      paymentStatus: paymentMethod === "COD" ? "PENDING" : "PENDING",
+      stockReserved: stockUpdates // Store stock reservation info for potential rollback
     });
     
-    await newOrder.save();
+    await newOrder.save({ session });
     
     // Clear cart after successful order
     await cartdb.findOneAndUpdate(
       { user: userId },
-      { $set: { items: [] } }
+      { $set: { items: [] } },
+      { session }
     );
+    
+    await session.commitTransaction();
     
     res.status(201).json({
       message: "Order created successfully",
       orderId: newOrder.orderId,
-      order: newOrder
+      order: newOrder,
+      stockUpdates: stockUpdates.map(update => ({
+        productId: update.productId,
+        reservedQuantity: update.reservedQuantity,
+        newAvailableStock: update.newQuantity
+      }))
     });
     
   } catch (error) {
+    await session.abortTransaction();
     console.error('Create order error:', error);
     res.status(500).json({ message: "Failed to create order", error: error.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+// ✅ New route: Restore stock when order is cancelled
+router.patch("/cancel/:orderId", authenticate, async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    const { orderId } = req.params;
+    const { reason } = req.body;
+    const userId = req.rootUser._id;
+    
+    const order = await orderdb.findOne({ orderId, user: userId }).session(session);
+    
+    if (!order) {
+      await session.abortTransaction();
+      return res.status(404).json({ message: "Order not found" });
+    }
+    
+    if (!["PENDING", "CONFIRMED"].includes(order.orderStatus)) {
+      await session.abortTransaction();
+      return res.status(400).json({ message: "Order cannot be cancelled at this stage" });
+    }
+    
+    // Restore stock for each item in the order
+    const stockRestorations = [];
+    for (const item of order.items) {
+      let product;
+      
+      // Find product by custom productId
+      product = await productdb.findOne({ productId: item.productId }).session(session);
+      
+      if (product) {
+        const restoredQuantity = product.stockQuantity + item.quantity;
+        await productdb.findByIdAndUpdate(
+          product._id,
+          { 
+            stockQuantity: restoredQuantity,
+            inStock: true // Since we're adding stock back
+          },
+          { session }
+        );
+        
+        stockRestorations.push({
+          productId: item.productId,
+          productName: item.productName,
+          restoredQuantity: item.quantity,
+          newAvailableStock: restoredQuantity
+        });
+      }
+    }
+    
+    // Update order status
+    order.orderStatus = "CANCELLED";
+    order.cancelledAt = new Date();
+    order.cancellationReason = reason || "Cancelled by customer";
+    order.cancelledBy = userId;
+    
+    order.statusHistory.push({
+      status: "CANCELLED",
+      timestamp: new Date(),
+      updatedBy: userId,
+      notes: order.cancellationReason
+    });
+    
+    await order.save({ session });
+    await session.commitTransaction();
+    
+    res.json({ 
+      message: "Order cancelled successfully", 
+      order,
+      stockRestorations
+    });
+    
+  } catch (error) {
+    await session.abortTransaction();
+    console.error('Cancel order error:', error);
+    res.status(500).json({ message: "Failed to cancel order", error: error.message });
+  } finally {
+    session.endSession();
   }
 });
 
@@ -242,48 +367,9 @@ router.get("/details/:orderId", authenticate, async (req, res) => {
   }
 });
 
-// ✅ 6. Cancel order (user)
-router.patch("/cancel/:orderId", authenticate, async (req, res) => {
-  try {
-    const { orderId } = req.params;
-    const { reason } = req.body;
-    const userId = req.rootUser._id;
-    
-    const order = await orderdb.findOne({ orderId, user: userId });
-    
-    if (!order) {
-      return res.status(404).json({ message: "Order not found" });
-    }
-    
-    if (!["PENDING", "CONFIRMED"].includes(order.orderStatus)) {
-      return res.status(400).json({ message: "Order cannot be cancelled at this stage" });
-    }
-    
-    order.orderStatus = "CANCELLED";
-    order.cancelledAt = new Date();
-    order.cancellationReason = reason || "Cancelled by customer";
-    order.cancelledBy = userId;
-    
-    order.statusHistory.push({
-      status: "CANCELLED",
-      timestamp: new Date(),
-      updatedBy: userId,
-      notes: order.cancellationReason
-    });
-    
-    await order.save();
-    
-    res.json({ message: "Order cancelled successfully", order });
-    
-  } catch (error) {
-    console.error('Cancel order error:', error);
-    res.status(500).json({ message: "Failed to cancel order", error: error.message });
-  }
-});
-
 // ========== ADMIN ROUTES ==========
 
-// ✅ 7. Get all orders (Admin)
+// ✅ 6. Get all orders (Admin)
 router.get("/admin/all", authenticate, authorizeRole('admin'), async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
@@ -339,17 +425,49 @@ router.get("/admin/all", authenticate, authorizeRole('admin'), async (req, res) 
   }
 });
 
-// ✅ 8. Update order status (Admin)
+// ✅ 7. Update order status (Admin) - with stock restoration for cancelled orders
 router.patch("/admin/update-status/:orderId", authenticate, authorizeRole('admin'), async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
   try {
     const { orderId } = req.params;
     const { status, notes, trackingInfo } = req.body;
     const adminId = req.rootUser._id;
     
-    const order = await orderdb.findOne({ orderId });
+    const order = await orderdb.findOne({ orderId }).session(session);
     
     if (!order) {
+      await session.abortTransaction();
       return res.status(404).json({ message: "Order not found" });
+    }
+    
+    // If changing to CANCELLED status, restore stock
+    if (status === 'CANCELLED' && order.orderStatus !== 'CANCELLED') {
+      const stockRestorations = [];
+      
+      for (const item of order.items) {
+        let product = await productdb.findOne({ productId: item.productId }).session(session);
+        
+        if (product) {
+          const restoredQuantity = product.stockQuantity + item.quantity;
+          await productdb.findByIdAndUpdate(
+            product._id,
+            { 
+              stockQuantity: restoredQuantity,
+              inStock: true
+            },
+            { session }
+          );
+          
+          stockRestorations.push({
+            productId: item.productId,
+            productName: item.productName,
+            restoredQuantity: item.quantity,
+            newAvailableStock: restoredQuantity
+          });
+        }
+      }
     }
     
     // Update order status
@@ -385,13 +503,17 @@ router.patch("/admin/update-status/:orderId", authenticate, authorizeRole('admin
       notes: notes || `Status updated to ${status} by admin`
     });
     
-    await order.save();
+    await order.save({ session });
+    await session.commitTransaction();
     
     res.json({ message: "Order status updated successfully", order });
     
   } catch (error) {
+    await session.abortTransaction();
     console.error('Update order status error:', error);
     res.status(500).json({ message: "Failed to update order status", error: error.message });
+  } finally {
+    session.endSession();
   }
 });
 

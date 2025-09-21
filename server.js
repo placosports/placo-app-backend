@@ -56,6 +56,7 @@ const initializeApp = async () => {
     app.use("/api/blogs", blogRoutes);  // Changed from "/blogs" to "/api/blogs"
     app.use('/api/orders', orderRoutes);
     app.use('/api/pincodes', pincodeRoutes);
+    app.use("/api", require("./routes/serviceRoutes"));
     
     
     // Start server
