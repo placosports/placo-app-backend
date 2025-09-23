@@ -1,4 +1,3 @@
-// Fix 3: Updated Blog Schema (add this to your blogSchema.js file)
 const mongoose = require("mongoose");
 
 const blogSchema = new mongoose.Schema({
@@ -18,12 +17,43 @@ const blogSchema = new mongoose.Schema({
     enum: ["giveaway", "info", "news", "training", "other"],
     default: "info",
   },
+  // NEW FIELD: Layout style determines visual presentation
+  layoutStyle: {
+    type: String,
+    enum: ["newspaper", "giveaway", "hero-flow", "magazine"],
+    default: "magazine"
+  },
+  // NEW FIELD: Layout-specific configuration
+  layoutMeta: {
+    heroImageIndex: { 
+      type: Number, 
+      default: 0 
+    },
+    accentColor: { 
+      type: String, 
+      default: "#007bff" 
+    },
+    subtitle: { 
+      type: String, 
+      default: "" 
+    },
+    callToAction: {
+      text: { 
+        type: String, 
+        default: "" 
+      },
+      link: { 
+        type: String, 
+        default: "" 
+      }
+    }
+  },
   // Keep the old single image field for backward compatibility
   image: {
     url: { type: String },
     public_id: { type: String },
   },
-  // Add the new images array field to match your API
+  // Images array field
   images: [
     {
       url: { type: String },

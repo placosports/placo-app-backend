@@ -13,7 +13,7 @@ router.post(
   upload.array("images", 5), // allow up to 5 images
   async (req, res) => {
     try {
-      const { title, content, type } = req.body;
+      const { title, content, type, layoutStyle, layoutMeta } = req.body;
       
       // Parse content - expecting JSON string with paragraph structure
       let parsedContent;
@@ -38,6 +38,26 @@ router.post(
         });
       }
       
+      // Parse layoutMeta if provided
+      let parsedLayoutMeta = {};
+      if (layoutMeta) {
+        try {
+          parsedLayoutMeta = typeof layoutMeta === 'string' ? JSON.parse(layoutMeta) : layoutMeta;
+        } catch (error) {
+          return res.status(400).json({ 
+            error: "Invalid layoutMeta format. Expected JSON object." 
+          });
+        }
+      }
+      
+      // Validate layoutStyle
+      const validLayoutStyles = ["newspaper", "giveaway", "hero-flow", "magazine"];
+      if (layoutStyle && !validLayoutStyles.includes(layoutStyle)) {
+        return res.status(400).json({ 
+          error: "Invalid layout style. Must be one of: " + validLayoutStyles.join(", ") 
+        });
+      }
+      
       // Process uploaded images
       const images = req.files ? req.files.map(file => ({
         url: file.path,
@@ -55,10 +75,19 @@ router.post(
         });
       }
 
+      // Validate hero image index if provided
+      if (parsedLayoutMeta.heroImageIndex !== undefined && parsedLayoutMeta.heroImageIndex >= images.length) {
+        return res.status(400).json({ 
+          error: `Invalid hero image index. You specified image ${parsedLayoutMeta.heroImageIndex} but only ${images.length} images were uploaded.`
+        });
+      }
+
       const blog = new Blog({
         title,
         content: parsedContent,
         type,
+        layoutStyle: layoutStyle || "magazine", // default to magazine layout
+        layoutMeta: parsedLayoutMeta,
         author: req.rootUser._id,
         images: images,
       });
@@ -118,7 +147,7 @@ router.put(
   upload.array("images", 5), // Changed from single to array
   async (req, res) => {
     try {
-      const { title, content, type } = req.body;
+      const { title, content, type, layoutStyle, layoutMeta } = req.body;
       
       // Parse content
       let parsedContent;
@@ -137,10 +166,32 @@ router.put(
         });
       }
 
+      // Parse layoutMeta if provided
+      let parsedLayoutMeta = {};
+      if (layoutMeta) {
+        try {
+          parsedLayoutMeta = typeof layoutMeta === 'string' ? JSON.parse(layoutMeta) : layoutMeta;
+        } catch (error) {
+          return res.status(400).json({ 
+            error: "Invalid layoutMeta format. Expected JSON object." 
+          });
+        }
+      }
+
+      // Validate layoutStyle
+      const validLayoutStyles = ["newspaper", "giveaway", "hero-flow", "magazine"];
+      if (layoutStyle && !validLayoutStyles.includes(layoutStyle)) {
+        return res.status(400).json({ 
+          error: "Invalid layout style. Must be one of: " + validLayoutStyles.join(", ") 
+        });
+      }
+
       const updateData = {
         title,
         content: parsedContent,
         type,
+        layoutStyle: layoutStyle || "magazine",
+        layoutMeta: parsedLayoutMeta,
         updatedAt: Date.now(),
       };
 
