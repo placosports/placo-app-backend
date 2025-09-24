@@ -1,10 +1,17 @@
 const mongoose = require("mongoose");
 
+// Enhanced service schema with options and pricing
 const serviceSchema = new mongoose.Schema({
   serviceName: {
     type: String,
     required: true,
-    enum: ["badminton_stringing", "badminton_repair", "racquet_maintenance", "grip_replacement"]
+    enum: [
+      "racquet_repair", 
+      "racquet_painting", 
+      "grip_replacement", 
+      "racquet_stringing", 
+      "shoes_sole_replacement"
+    ]
   },
   displayName: {
     type: String,
@@ -14,9 +21,10 @@ const serviceSchema = new mongoose.Schema({
     type: String,
     required: true
   },
-  price: {
+  basePrice: {
     type: Number,
-    required: true
+    required: true,
+    default: 0
   },
   estimatedDays: {
     type: Number,
@@ -30,18 +38,93 @@ const serviceSchema = new mongoose.Schema({
   image: {
     type: String,
     required: false
-  }
+  },
+  
+  // Service-specific options with pricing
+  serviceOptions: [{
+    optionType: {
+      type: String,
+      required: true,
+      enum: [
+        "racquet_type", // For repair: low/mid/premium
+        "paint_type", // For painting: simple/new_design
+        "grip_type", // For grip: standard/cushion_wrap
+        "grip_color", // Color options for grip
+        "string_type", // String options for stringing
+        "shoe_sport", // Sport type for shoes
+        "shoe_category", // Men's/Women's for shoes
+        "add_ons" // Additional services like grommets, handle repair
+      ]
+    },
+    optionName: {
+      type: String,
+      required: true
+    },
+    optionValue: {
+      type: String,
+      required: false
+    },
+    additionalPrice: {
+      type: Number,
+      default: 0
+    },
+    isRequired: {
+      type: Boolean,
+      default: false
+    },
+    description: String
+  }],
+  
+  // Available string choices (for admin to manage)
+  availableStrings: [{
+    stringName: {
+      type: String,
+      required: true
+    },
+    stringBrand: String,
+    additionalPrice: {
+      type: Number,
+      default: 0
+    },
+    isAvailable: {
+      type: Boolean,
+      default: true
+    }
+  }],
+  
+  // Available grip colors
+  availableGripColors: [{
+    colorName: String,
+    colorCode: String,
+    additionalPrice: {
+      type: Number,
+      default: 0
+    }
+  }],
+  
+  // Size ranges for shoes
+  availableSizes: [{
+    category: {
+      type: String,
+      enum: ["men", "women"]
+    },
+    sizes: [String],
+    pricePerSize: {
+      type: Number,
+      default: 0
+    }
+  }]
 }, {
   timestamps: true
 });
 
+// Enhanced booking schema to handle selected options
 const serviceBookingSchema = new mongoose.Schema({
   bookingId: {
     type: String,
     required: true,
     unique: true,
     default: function() {
-      // Generate default bookingId immediately
       const timestamp = Date.now().toString().slice(-6);
       const random = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
       return `SB${timestamp}${random}`;
@@ -80,17 +163,50 @@ const serviceBookingSchema = new mongoose.Schema({
       type: String,
       required: false
     },
-    stringType: {
-      type: String,
-      required: false // Only for stringing service
+    racquetName: String, // New field for racquet name
+    
+    // Selected service options
+    selectedOptions: [{
+      optionType: String,
+      optionName: String,
+      optionValue: String,
+      additionalPrice: Number
+    }],
+    
+    // For stringing services
+    selectedString: {
+      stringName: String,
+      stringBrand: String,
+      stringTension: String,
+      additionalPrice: {
+        type: Number,
+        default: 0
+      }
     },
-    stringTension: {
-      type: String,
-      required: false // Only for stringing service
+    
+    // For grip services
+    selectedGripColor: {
+      colorName: String,
+      colorCode: String,
+      additionalPrice: {
+        type: Number,
+        default: 0
+      }
     },
+    
+    // For shoes
+    selectedSize: {
+      category: String,
+      size: String,
+      additionalPrice: {
+        type: Number,
+        default: 0
+      }
+    },
+    
     issueDescription: {
       type: String,
-      required: false // Required for repair services
+      required: false
     },
     images: [{
       url: String,
@@ -126,7 +242,15 @@ const serviceBookingSchema = new mongoose.Schema({
       enum: ["COD", "PAID_TO_SELLER", "PAY_AT_SHOP", "PAID_ONLINE"],
       required: true
     },
-    amount: {
+    baseAmount: {
+      type: Number,
+      required: true
+    },
+    optionsAmount: {
+      type: Number,
+      default: 0
+    },
+    totalAmount: {
       type: Number,
       required: true
     },
@@ -183,22 +307,27 @@ const serviceBookingSchema = new mongoose.Schema({
   timestamps: true
 });
 
-// Generate a more sophisticated booking ID before saving
+// Calculate total amount before saving
+serviceBookingSchema.pre('save', function(next) {
+  if (this.isModified('paymentDetails.baseAmount') || this.isModified('paymentDetails.optionsAmount')) {
+    this.paymentDetails.totalAmount = this.paymentDetails.baseAmount + this.paymentDetails.optionsAmount;
+  }
+  next();
+});
+
+// Rest of the existing middleware...
 serviceBookingSchema.pre('save', async function(next) {
   if (this.isNew && (!this.bookingId || this.bookingId.includes('SB'))) {
     try {
-      // Use this.constructor instead of mongoose.model to avoid circular reference
       const count = await this.constructor.countDocuments();
       const timestamp = Date.now().toString().slice(-6);
       const counter = (count + 1).toString().padStart(3, '0');
       this.bookingId = `SB${timestamp}${counter}`;
     } catch (error) {
-      // Fallback if count fails - keep the default generated ID
       console.warn('Error generating sophisticated bookingId, using default:', error.message);
     }
   }
   
-  // Set estimated delivery date
   if (!this.estimatedDeliveryDate && this.service) {
     try {
       const Service = mongoose.model('Service');
@@ -216,7 +345,6 @@ serviceBookingSchema.pre('save', async function(next) {
   next();
 });
 
-// Add timeline entry when status changes
 serviceBookingSchema.pre('save', function(next) {
   if (this.isModified('status') && !this.isNew) {
     this.timeline.push({
