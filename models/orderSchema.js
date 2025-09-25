@@ -49,10 +49,10 @@ const orderSchema = new mongoose.Schema({
     country: { type: String, default: "India" }
   },
 
-  // Payment Details
+  // Payment Details - Updated for Razorpay
   paymentMethod: {
     type: String,
-    enum: ["COD", "PAID_TO_SELLER"],
+    enum: ["COD", "RAZORPAY"],
     required: true
   },
   paymentStatus: {
@@ -60,10 +60,16 @@ const orderSchema = new mongoose.Schema({
     enum: ["PENDING", "PAID", "FAILED", "REFUNDED"],
     default: "PENDING"
   },
-  paymentProof: {
-    url: { type: String },
-    public_id: { type: String },
-    uploadedAt: { type: Date }
+  
+  // Razorpay Payment Details
+  razorpayDetails: {
+    razorpay_order_id: { type: String },
+    razorpay_payment_id: { type: String },
+    razorpay_signature: { type: String },
+    amount_paid: { type: Number },
+    payment_method: { type: String }, // card, upi, netbanking, wallet
+    verified: { type: Boolean, default: false },
+    payment_date: { type: Date }
   },
 
   // Order Status

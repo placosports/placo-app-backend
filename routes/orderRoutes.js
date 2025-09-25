@@ -3,8 +3,9 @@ const express = require("express");
 const router = express.Router();
 const authenticate = require("../middleware/authenticate");
 const authorizeRole = require("../middleware/authorizeRole");
-const upload = require("../middleware/multer");
 const mongoose = require("mongoose");
+const crypto = require('crypto');
+const razorpay = require("../middleware/razorpay");
 const orderdb = require("../models/orderSchema");
 const cartdb = require("../models/cartSchema");
 const productdb = require("../models/productSchema");
@@ -41,53 +42,133 @@ router.get("/check-cod/:pincode", async (req, res) => {
   }
 });
 
-// ✅ 2. Create order from cart with stock management
-router.post("/create", authenticate, async (req, res) => {
+// ✅ 2. Create Razorpay order (before placing actual order)
+router.post("/create-razorpay-order", authenticate, async (req, res) => {
+  try {
+    const { amount, currency = "INR" } = req.body;
+    const userId = req.rootUser._id;
+
+    // Create Razorpay order
+    const options = {
+      amount: amount * 100, // Amount in paise
+      currency: currency,
+      receipt: `order_rcptid_${Date.now()}`,
+      payment_capture: 1
+    };
+
+    const razorpayOrder = await razorpay.orders.create(options);
+
+    res.json({
+      success: true,
+      order: razorpayOrder,
+      key_id: process.env.RAZORPAY_KEY_ID
+    });
+
+  } catch (error) {
+    console.error('Create Razorpay order error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to create Razorpay order", 
+      error: error.message 
+    });
+  }
+});
+
+// ✅ 3. Verify Razorpay payment
+router.post("/verify-payment", authenticate, async (req, res) => {
+  try {
+    const { 
+      razorpay_order_id, 
+      razorpay_payment_id, 
+      razorpay_signature,
+      order_data
+    } = req.body;
+
+    // Verify signature
+    const body = razorpay_order_id + "|" + razorpay_payment_id;
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(body.toString())
+      .digest("hex");
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment verification failed"
+      });
+    }
+
+    // Payment verified, now create the order with payment details
+    const orderData = {
+      ...order_data,
+      razorpayDetails: {
+        razorpay_order_id,
+        razorpay_payment_id,
+        razorpay_signature,
+        verified: true,
+        payment_date: new Date()
+      }
+    };
+
+    // Call the create order function
+    const result = await createOrderWithPayment(req.rootUser._id, orderData);
+    
+    res.json({
+      success: true,
+      message: "Payment verified and order created",
+      ...result
+    });
+
+  } catch (error) {
+    console.error('Verify payment error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Payment verification failed", 
+      error: error.message 
+    });
+  }
+});
+
+// Helper function to create order after payment verification
+async function createOrderWithPayment(userId, orderData) {
   const session = await mongoose.startSession();
   session.startTransaction();
   
   try {
-    const { shippingAddress, paymentMethod } = req.body;
-    const userId = req.rootUser._id;
+    const { shippingAddress, paymentMethod, razorpayDetails } = orderData;
     
     // Get user's cart WITHOUT populate to avoid ObjectId casting errors
     const cart = await cartdb.findOne({ user: userId }).session(session);
     
     if (!cart || cart.items.length === 0) {
       await session.abortTransaction();
-      return res.status(400).json({ message: "Cart is empty" });
+      throw new Error("Cart is empty");
     }
     
     // Get product details, check stock, and calculate totals
     let orderItems = [];
     let subtotal = 0;
-    let stockUpdates = []; // Track stock changes for rollback if needed
+    let stockUpdates = [];
     
     for (const cartItem of cart.items) {
       let product;
       
       // Check if the productId is a valid MongoDB ObjectId or custom string
       if (mongoose.Types.ObjectId.isValid(cartItem.productId)) {
-        // Query by MongoDB _id
         product = await productdb.findById(cartItem.productId).session(session);
       } else {
-        // Query by custom productId field
         product = await productdb.findOne({ productId: cartItem.productId }).session(session);
       }
       
       if (!product) {
         await session.abortTransaction();
-        return res.status(400).json({ 
-          message: `Product ${cartItem.productId} not found` 
-        });
+        throw new Error(`Product ${cartItem.productId} not found`);
       }
       
       // Check if enough stock is available
       if (product.stockQuantity < cartItem.quantity) {
         await session.abortTransaction();
-        return res.status(400).json({ 
-          message: `Insufficient stock for ${product.productName}. Available: ${product.stockQuantity}, Requested: ${cartItem.quantity}` 
-        });
+        throw new Error(`Insufficient stock for ${product.productName}. Available: ${product.stockQuantity}, Requested: ${cartItem.quantity}`);
       }
       
       // Reserve stock by reducing the quantity
@@ -101,7 +182,6 @@ router.post("/create", authenticate, async (req, res) => {
         { session }
       );
       
-      // Track this change for potential rollback
       stockUpdates.push({
         productId: product._id,
         originalQuantity: product.stockQuantity,
@@ -142,7 +222,7 @@ router.post("/create", authenticate, async (req, res) => {
     
     const total = subtotal + tax + shipping;
     
-    // Create order
+    // Create order with payment details
     const newOrder = new orderdb({
       user: userId,
       items: orderItems,
@@ -154,8 +234,10 @@ router.post("/create", authenticate, async (req, res) => {
       },
       shippingAddress,
       paymentMethod,
-      paymentStatus: paymentMethod === "COD" ? "PENDING" : "PENDING",
-      stockReserved: stockUpdates // Store stock reservation info for potential rollback
+      paymentStatus: paymentMethod === "RAZORPAY" ? "PAID" : "PENDING",
+      razorpayDetails: paymentMethod === "RAZORPAY" ? razorpayDetails : undefined,
+      orderStatus: paymentMethod === "RAZORPAY" ? "CONFIRMED" : "PENDING",
+      confirmedAt: paymentMethod === "RAZORPAY" ? new Date() : undefined
     });
     
     await newOrder.save({ session });
@@ -169,8 +251,7 @@ router.post("/create", authenticate, async (req, res) => {
     
     await session.commitTransaction();
     
-    res.status(201).json({
-      message: "Order created successfully",
+    return {
       orderId: newOrder.orderId,
       order: newOrder,
       stockUpdates: stockUpdates.map(update => ({
@@ -178,6 +259,37 @@ router.post("/create", authenticate, async (req, res) => {
         reservedQuantity: update.reservedQuantity,
         newAvailableStock: update.newQuantity
       }))
+    };
+    
+  } catch (error) {
+    await session.abortTransaction();
+    throw error;
+  } finally {
+    session.endSession();
+  }
+}
+
+// ✅ 4. Create order (COD orders)
+router.post("/create", authenticate, async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    const { shippingAddress, paymentMethod } = req.body;
+    const userId = req.rootUser._id;
+    
+    // Only allow COD through this route
+    if (paymentMethod !== "COD") {
+      return res.status(400).json({ 
+        message: "This route only supports COD orders. Use Razorpay flow for online payments." 
+      });
+    }
+    
+    const result = await createOrderWithPayment(userId, { shippingAddress, paymentMethod });
+    
+    res.status(201).json({
+      message: "Order created successfully",
+      ...result
     });
     
   } catch (error) {
@@ -189,7 +301,7 @@ router.post("/create", authenticate, async (req, res) => {
   }
 });
 
-// ✅ New route: Restore stock when order is cancelled
+// ✅ 5. Cancel order and restore stock
 router.patch("/cancel/:orderId", authenticate, async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -211,13 +323,17 @@ router.patch("/cancel/:orderId", authenticate, async (req, res) => {
       return res.status(400).json({ message: "Order cannot be cancelled at this stage" });
     }
     
+    // Handle refund for Razorpay orders
+    if (order.paymentMethod === "RAZORPAY" && order.paymentStatus === "PAID") {
+      // In a real implementation, you would initiate a refund here
+      // For now, we'll just update the payment status
+      order.paymentStatus = "REFUNDED";
+    }
+    
     // Restore stock for each item in the order
     const stockRestorations = [];
     for (const item of order.items) {
-      let product;
-      
-      // Find product by custom productId
-      product = await productdb.findOne({ productId: item.productId }).session(session);
+      let product = await productdb.findOne({ productId: item.productId }).session(session);
       
       if (product) {
         const restoredQuantity = product.stockQuantity + item.quantity;
@@ -225,7 +341,7 @@ router.patch("/cancel/:orderId", authenticate, async (req, res) => {
           product._id,
           { 
             stockQuantity: restoredQuantity,
-            inStock: true // Since we're adding stock back
+            inStock: true
           },
           { session }
         );
@@ -270,56 +386,7 @@ router.patch("/cancel/:orderId", authenticate, async (req, res) => {
   }
 });
 
-// ✅ 3. Upload payment proof
-router.post("/payment-proof/:orderId", authenticate, upload.single('paymentProof'), async (req, res) => {
-  try {
-    const { orderId } = req.params;
-    const userId = req.rootUser._id;
-    
-    if (!req.file) {
-      return res.status(400).json({ message: "Payment proof image is required" });
-    }
-    
-    const order = await orderdb.findOne({ orderId, user: userId });
-    
-    if (!order) {
-      return res.status(404).json({ message: "Order not found" });
-    }
-    
-    if (order.paymentMethod !== "PAID_TO_SELLER") {
-      return res.status(400).json({ message: "Payment proof only allowed for 'Paid to Seller' orders" });
-    }
-    
-    // Update order with payment proof
-    order.paymentProof = {
-      url: req.file.path,
-      public_id: req.file.filename,
-      uploadedAt: new Date()
-    };
-    order.paymentStatus = "PAID";
-    
-    // Add to status history
-    order.statusHistory.push({
-      status: "PAYMENT_UPLOADED",
-      timestamp: new Date(),
-      updatedBy: userId,
-      notes: "Payment proof uploaded by customer"
-    });
-    
-    await order.save();
-    
-    res.json({
-      message: "Payment proof uploaded successfully",
-      paymentProof: order.paymentProof
-    });
-    
-  } catch (error) {
-    console.error('Upload payment proof error:', error);
-    res.status(500).json({ message: "Failed to upload payment proof", error: error.message });
-  }
-});
-
-// ✅ 4. Get user's orders
+// ✅ 6. Get user's orders
 router.get("/my-orders", authenticate, async (req, res) => {
   try {
     const userId = req.rootUser._id;
@@ -347,7 +414,7 @@ router.get("/my-orders", authenticate, async (req, res) => {
   }
 });
 
-// ✅ 5. Get specific order details
+// ✅ 7. Get specific order details
 router.get("/details/:orderId", authenticate, async (req, res) => {
   try {
     const { orderId } = req.params;
@@ -369,7 +436,7 @@ router.get("/details/:orderId", authenticate, async (req, res) => {
 
 // ========== ADMIN ROUTES ==========
 
-// ✅ 6. Get all orders (Admin)
+// ✅ 8. Get all orders (Admin)
 router.get("/admin/all", authenticate, authorizeRole('admin'), async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
@@ -425,7 +492,7 @@ router.get("/admin/all", authenticate, authorizeRole('admin'), async (req, res) 
   }
 });
 
-// ✅ 7. Update order status (Admin) - with stock restoration for cancelled orders
+// ✅ 9. Update order status (Admin)
 router.patch("/admin/update-status/:orderId", authenticate, authorizeRole('admin'), async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -442,10 +509,14 @@ router.patch("/admin/update-status/:orderId", authenticate, authorizeRole('admin
       return res.status(404).json({ message: "Order not found" });
     }
     
-    // If changing to CANCELLED status, restore stock
+    // If changing to CANCELLED status, restore stock and handle refunds
     if (status === 'CANCELLED' && order.orderStatus !== 'CANCELLED') {
-      const stockRestorations = [];
+      // Handle refund for Razorpay orders
+      if (order.paymentMethod === "RAZORPAY" && order.paymentStatus === "PAID") {
+        order.paymentStatus = "REFUNDED";
+      }
       
+      // Restore stock
       for (const item of order.items) {
         let product = await productdb.findOne({ productId: item.productId }).session(session);
         
@@ -459,13 +530,6 @@ router.patch("/admin/update-status/:orderId", authenticate, authorizeRole('admin
             },
             { session }
           );
-          
-          stockRestorations.push({
-            productId: item.productId,
-            productName: item.productName,
-            restoredQuantity: item.quantity,
-            newAvailableStock: restoredQuantity
-          });
         }
       }
     }
@@ -516,5 +580,149 @@ router.patch("/admin/update-status/:orderId", authenticate, authorizeRole('admin
     session.endSession();
   }
 });
+
+// ✅ 10. Razorpay Webhook (for payment status updates)
+router.post("/razorpay-webhook", async (req, res) => {
+  try {
+    const webhookSignature = req.headers['x-razorpay-signature'];
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    
+    // Verify webhook signature
+    const expectedSignature = crypto
+      .createHmac('sha256', webhookSecret)
+      .update(JSON.stringify(req.body))
+      .digest('hex');
+    
+    if (expectedSignature !== webhookSignature) {
+      return res.status(400).json({ message: 'Invalid webhook signature' });
+    }
+    
+    const { event, payload } = req.body;
+    
+    // Handle different webhook events
+    switch (event) {
+      case 'payment.captured':
+        await handlePaymentCaptured(payload.payment.entity);
+        break;
+      case 'payment.failed':
+        await handlePaymentFailed(payload.payment.entity);
+        break;
+      case 'order.paid':
+        await handleOrderPaid(payload.order.entity);
+        break;
+    }
+    
+    res.status(200).json({ status: 'ok' });
+    
+  } catch (error) {
+    console.error('Webhook error:', error);
+    res.status(500).json({ message: 'Webhook processing failed' });
+  }
+});
+
+// Helper functions for webhook events
+async function handlePaymentCaptured(payment) {
+  try {
+    const order = await orderdb.findOne({ 
+      'razorpayDetails.razorpay_payment_id': payment.id 
+    });
+    
+    if (order) {
+      order.paymentStatus = 'PAID';
+      order.razorpayDetails.amount_paid = payment.amount / 100; // Convert from paise
+      order.razorpayDetails.payment_method = payment.method;
+      
+      order.statusHistory.push({
+        status: 'PAYMENT_CAPTURED',
+        timestamp: new Date(),
+        notes: 'Payment captured via webhook'
+      });
+      
+      await order.save();
+    }
+  } catch (error) {
+    console.error('Handle payment captured error:', error);
+  }
+}
+
+async function handlePaymentFailed(payment) {
+  try {
+    const order = await orderdb.findOne({ 
+      'razorpayDetails.razorpay_payment_id': payment.id 
+    });
+    
+    if (order) {
+      order.paymentStatus = 'FAILED';
+      order.orderStatus = 'CANCELLED';
+      
+      order.statusHistory.push({
+        status: 'PAYMENT_FAILED',
+        timestamp: new Date(),
+        notes: 'Payment failed via webhook'
+      });
+      
+      await order.save();
+      
+      // Restore stock when payment fails
+      await restoreOrderStock(order);
+    }
+  } catch (error) {
+    console.error('Handle payment failed error:', error);
+  }
+}
+
+async function handleOrderPaid(razorpayOrder) {
+  try {
+    const order = await orderdb.findOne({ 
+      'razorpayDetails.razorpay_order_id': razorpayOrder.id 
+    });
+    
+    if (order) {
+      order.orderStatus = 'CONFIRMED';
+      order.confirmedAt = new Date();
+      
+      order.statusHistory.push({
+        status: 'ORDER_CONFIRMED',
+        timestamp: new Date(),
+        notes: 'Order confirmed via webhook'
+      });
+      
+      await order.save();
+    }
+  } catch (error) {
+    console.error('Handle order paid error:', error);
+  }
+}
+
+// Helper function to restore stock
+async function restoreOrderStock(order) {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    for (const item of order.items) {
+      const product = await productdb.findOne({ productId: item.productId }).session(session);
+      
+      if (product) {
+        const restoredQuantity = product.stockQuantity + item.quantity;
+        await productdb.findByIdAndUpdate(
+          product._id,
+          { 
+            stockQuantity: restoredQuantity,
+            inStock: true
+          },
+          { session }
+        );
+      }
+    }
+    
+    await session.commitTransaction();
+  } catch (error) {
+    await session.abortTransaction();
+    throw error;
+  } finally {
+    session.endSession();
+  }
+}
 
 module.exports = router;
